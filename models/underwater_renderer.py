@@ -221,65 +221,163 @@ class UnderwaterRenderer(nn.Module):
             outputs["water_light_depth_down"] = field_outputs["depth_down"]
             outputs["global_downwelling_irradiance"] = field_outputs["downwelling_scalar"]
 
-        direct_underwater_rgb = outputs.get("direct_underwater_rgb")
-        if direct_underwater_rgb is None:
-            direct_underwater_rgb = scene_rgb_raw * outputs.get("transmission", torch.ones_like(scene_rgb))
-        backscatter = outputs.get("backscatter")
-        if backscatter is None:
-            backscatter = torch.clamp(underwater_rgb - direct_underwater_rgb, min=0.0)
-        backscatter_compressed = backscatter / (1.0 + backscatter.detach())
+        # ---- Unified single-scatter ray-march ----
+        # Along each camera ray we integrate two volumetric sources that share
+        # the same transmittance T(s) = exp(-∫σ_t ds):
+        #   S_direct(p)  = σ_s(p) · φ_HG(θ) · L_direct(p)
+        #                    single-scatter of the downwelling column toward
+        #                    the camera — this is what the eye reads as light
+        #                    shafts/beams.
+        #   S_ambient(p) = σ_t(p) · b_inf(p)
+        #                    diffuse in-scatter equivalent to Jaffe's haze
+        #                    term; it converges to the closed-form backscatter
+        #                    in the homogeneous limit.
+        # The boundary radiance is scene_rgb_raw attenuated by the same column
+        # and shaded by the surface-attached caustic gain G_surface. The three
+        # effects (beams, haze, surface caustics) therefore fall out of a
+        # single integral rather than being composited from separate modules.
+        zeros_rgb_ref = torch.zeros_like(scene_rgb)
+        beam_rgb = zeros_rgb_ref.clone()
+        ambient_rgb = zeros_rgb_ref.clone()
+        phase_map = torch.zeros_like(scene_depth)
 
-        if field_outputs is not None:
-            down_scalar = field_outputs["downwelling_scalar"]
-            global_source = field_outputs["L_in"].mean(dim=0, keepdim=True)
-            global_field = self.soft_blur_scalar(global_source)
-            global_gain = self.make_unit_mean_gain(global_field, visible_mask, scale=0.45, clamp_min=0.82, clamp_max=1.18)
+        if field_outputs is not None and self.water_light_field is not None:
+            cos_theta = torch.clamp(
+                ((-pixel_ray_dir_world) * down_dir_world).sum(dim=0, keepdim=True),
+                min=-1.0,
+                max=1.0,
+            )
+            g = self.beam_phase_g
+            denom = torch.clamp(1.0 + g * g - 2.0 * g * cos_theta, min=1e-4)
+            phase = (1.0 - g * g) / (4.0 * torch.pi * torch.pow(denom, 1.5))
+            phase_map = phase
+
+            scene_distance = torch.linalg.norm(
+                surface_points_world - camera_center_world, dim=0, keepdim=True
+            )
+            background_distance = self.background_depth.to(
+                device=scene_depth.device, dtype=scene_depth.dtype
+            ).view(1, 1, 1)
+            scene_distance = torch.where(
+                visible_mask > 0.5,
+                scene_distance,
+                torch.ones_like(scene_distance) * background_distance,
+            )
+            if self.submerged_only:
+                t_surface = torch.zeros_like(scene_depth)
+            else:
+                ray_interface = self.estimate_ray_interface(
+                    camera_center_world=camera_center_world,
+                    pixel_ray_dir_world=pixel_ray_dir_world,
+                    water_level=water_level,
+                    visible_mask=visible_mask,
+                    surface_points_world=surface_points_world,
+                    time_value=time_value,
+                )
+                t_surface = torch.clamp(ray_interface["ray_interface_distance"], min=0.0)
+            D = torch.clamp(scene_distance - t_surface, min=1e-4)
+
+            step_count = max(int(self.beam_num_steps), 1)
+            dt = D / float(step_count)
+            optical_depth = zeros_rgb_ref.clone()
+
+            for step_idx in range(step_count):
+                alpha = (step_idx + 0.5) / float(step_count)
+                t_i = t_surface + alpha * D
+                p_i = camera_center_world + pixel_ray_dir_world * t_i
+                field_i = self.water_light_field.query(
+                    p_i,
+                    time_value,
+                    view_dir_world=-pixel_ray_dir_world,
+                    down_dir_world=down_dir_world,
+                    valid_mask=visible_mask,
+                    caustic_outputs=caustic_outputs,
+                )
+                sigma_t_i = field_i["sigma_t_view"]
+                sigma_s_i = field_i["sigma_s"]
+                L_in_i = field_i["L_in"]
+                b_inf_i = field_i["b_inf"]
+                down_scalar_i = torch.clamp(field_i["downwelling_scalar"], min=0.0, max=4.0)
+
+                optical_depth = optical_depth + sigma_t_i * dt
+                T_i = torch.exp(-optical_depth)
+                # Column emphasis on the direct source: the caustic pattern
+                # modulates the single-scatter magnitude without changing its
+                # mean, so bright columns appear as shafts and the integral
+                # stays energy-consistent.
+                S_direct = sigma_s_i * phase * L_in_i * down_scalar_i
+                S_ambient = sigma_t_i * b_inf_i
+                beam_rgb = beam_rgb + S_direct * T_i * dt
+                ambient_rgb = ambient_rgb + S_ambient * T_i * dt
+
+            # Upper-hemisphere gate mirrors physical shaft visibility: only
+            # rays pointing toward the surface cross the caustic columns.
+            ray_up = pixel_ray_dir_world[self.up_axis : self.up_axis + 1]
+            upper_weight = torch.sigmoid((ray_up + 0.02) / 0.30)
+            beam_rgb = beam_rgb * upper_weight * visible_mask
+            beam_rgb = torch.clamp(
+                torch.nn.functional.avg_pool2d(
+                    beam_rgb.unsqueeze(0), kernel_size=3, stride=1, padding=1
+                ).squeeze(0),
+                0.0,
+                1.0,
+            )
+            ambient_rgb = ambient_rgb * visible_mask
+            direct_underwater_rgb = scene_rgb_raw * outputs.get(
+                "transmission", torch.exp(-optical_depth)
+            )
         else:
-            down_scalar = torch.ones_like(scene_depth)
-            global_field = down_scalar
-            global_gain = torch.ones_like(scene_depth)
+            direct_underwater_rgb = outputs.get("direct_underwater_rgb")
+            if direct_underwater_rgb is None:
+                direct_underwater_rgb = scene_rgb_raw * outputs.get(
+                    "transmission", torch.ones_like(scene_rgb)
+                )
+            fallback_backscatter = outputs.get("backscatter")
+            if fallback_backscatter is None:
+                fallback_backscatter = torch.clamp(underwater_rgb - direct_underwater_rgb, min=0.0)
+            ambient_rgb = fallback_backscatter
 
         attached_pattern = caustic_outputs.get(
             "surface_attached_pattern",
-            caustic_outputs.get("attached_base_pattern", caustic_outputs.get("base_caustic_pattern", torch.ones_like(scene_depth))),
+            caustic_outputs.get(
+                "attached_base_pattern",
+                caustic_outputs.get("base_caustic_pattern", torch.ones_like(scene_depth)),
+            ),
         )
-        receiver_support = caustic_outputs.get("receiver_support", torch.ones_like(scene_depth)).clamp(0.0, 1.0)
+        receiver_support = caustic_outputs.get(
+            "receiver_support", torch.ones_like(scene_depth)
+        ).clamp(0.0, 1.0)
         if self.enable_caustic and self.caustic_module is not None:
             lambda_phys = self.caustic_module.compute_physical_lambda(surface_outputs, visible_mask)
-            effective_lambda = torch.clamp(lambda_phys + self.caustic_module.lambda_c, min=self.caustic_module.min_lambda)
+            effective_lambda = torch.clamp(
+                lambda_phys + self.caustic_module.lambda_c,
+                min=self.caustic_module.min_lambda,
+            )
         else:
             effective_lambda = torch.ones_like(scene_depth) * 0.15
 
         local_delta = (attached_pattern - 1.0) * receiver_support
         surface_detail = effective_lambda * local_delta
-        unified_gain = torch.clamp(global_gain + surface_detail, min=0.55, max=1.35)
-        surface_caustic = unified_gain - 1.0
+        G_surface = torch.clamp(1.0 + surface_detail, min=0.55, max=1.75)
 
-        outputs["surface_caustic_base"] = global_gain - 1.0
-        outputs["surface_caustic_detail"] = surface_detail
-        outputs["global_irradiance_variation"] = global_gain
-        outputs["caustic"] = surface_caustic
-        outputs["caustic_gain"] = unified_gain
-        outputs["global_irradiance_mod"] = global_gain
-
-        underwater_base = torch.clamp(direct_underwater_rgb * unified_gain + backscatter_compressed, 0.0, 1.0)
-
-        beam_outputs = self.build_visible_light_beam(
-            scene_depth=scene_depth,
-            visible_mask=visible_mask,
-            surface_points_world=surface_points_world,
-            camera_center_world=camera_center_world,
-            pixel_ray_dir_world=pixel_ray_dir_world,
-            water_level=water_level,
-            water_height_world=water_height_world,
-            time_value=time_value,
-            caustic_outputs=caustic_outputs,
-            n_beam_steps=self.beam_num_steps,
-        )
-        outputs.update(beam_outputs)
-
-        beam_rgb = beam_outputs["light_beam_rgb"].clamp(0.0, 1.0)
+        ambient_compressed = ambient_rgb / (1.0 + ambient_rgb.detach())
+        direct_shaded = direct_underwater_rgb * G_surface
+        underwater_base = torch.clamp(direct_shaded + ambient_compressed, 0.0, 1.0)
         underwater_lit = torch.clamp(underwater_base + beam_rgb, 0.0, 1.0)
+
+        outputs["direct_underwater_rgb"] = direct_underwater_rgb
+        outputs["backscatter"] = ambient_rgb
+        outputs["surface_caustic_base"] = torch.zeros_like(scene_depth)
+        outputs["surface_caustic_detail"] = surface_detail
+        outputs["global_irradiance_variation"] = torch.ones_like(scene_depth)
+        outputs["caustic"] = G_surface - 1.0
+        outputs["caustic_gain"] = G_surface
+        outputs["global_irradiance_mod"] = torch.ones_like(scene_depth)
+        outputs["light_beam"] = beam_rgb.mean(dim=0, keepdim=True)
+        outputs["light_beam_rgb"] = beam_rgb
+        outputs["light_beam_source"] = torch.zeros_like(scene_depth)
+        outputs["light_beam_alignment"] = phase_map
+        outputs["light_beam_depth"] = torch.zeros_like(scene_depth)
         outputs["underwater_base"] = underwater_base
         outputs["underwater_lit"] = underwater_lit
         interface_outputs = self.build_visible_interface(

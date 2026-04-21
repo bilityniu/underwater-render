@@ -104,7 +104,6 @@ class RefractionCausticField(nn.Module):
             water_outputs=water_outputs,
         )
         sampled_caustic = base_pattern
-        attached_base_pattern = base_pattern
         detail_modulation = torch.ones_like(base_pattern)
         receiver_query_pattern = base_pattern
         receiver_focus_weight = torch.zeros_like(base_pattern)
@@ -131,7 +130,10 @@ class RefractionCausticField(nn.Module):
                 if curvature is not None:
                     focus_driver = focus_driver + curvature
                 focus_driver = self.blur_plane_map(focus_driver).clamp_min(0.0)
-                focus_gain = 1.0 + 0.08 * self.normalize_pattern(focus_driver.squeeze(0), valid_mask).unsqueeze(0)
+                # Stronger focus lobe from the water slope/curvature, applied as
+                # a surface-attached detail layer over the low-pass caustic.
+                focus_gain = 1.0 + 0.35 * self.normalize_pattern(focus_driver.squeeze(0), valid_mask).unsqueeze(0)
+        attached_base_pattern = base_pattern * focus_gain.squeeze(0)
 
         receiver_support = (0.80 + 0.20 * receiver_state["receiver_alignment"]).unsqueeze(0)
         final_caustic = sampled_caustic.unsqueeze(0) * light_response * surface_focus * focus_gain * receiver_support

@@ -89,8 +89,10 @@ class WaterLightField(nn.Module):
             min=0.0,
         )
 
-        # Use the medium ambient color as the water-light tint.
-        light_color = torch.clamp(0.72 * b_inf + 0.28, 0.0, 1.0)
+        # Incident sunlight is decoupled from the ambient fog color. The
+        # downwelling radiance enters the water as broadband white light; it
+        # only acquires the medium tint after travelling through sigma_t_down.
+        light_color = torch.ones_like(b_inf)
         L_surface = light_color * down_scalar
         L_in = L_surface * torch.exp(-sigma_t_down * depth_down)
 
