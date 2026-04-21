@@ -1,0 +1,24 @@
+# Dataset and generated results
+data/
+output/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Environment and logs
+.env
+.venv/
+venv/
+*.log
+
+# OS/editor junk
+.DS_Store
+.idea/
+.vscode/

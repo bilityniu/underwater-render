@@ -1,0 +1,4 @@
+render_mode: clean_pgsr
+enable_underwater: false
+enable_surface: false
+enable_caustic: false
